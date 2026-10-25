@@ -48,7 +48,7 @@ api_secret = os.getenv("API_SECRET")
 # ═══════════════════════════════════════════════════════════════════════════
 #  ACCOUNT CONFIGURATION (PILIH DEMO ATAU REAL)
 # ═══════════════════════════════════════════════════════════════════════════
-USE_DEMO_ACCOUNT = False  # SET True = Binance Futures Testnet (Demo) | False = Real Binance Mainnet
+USE_DEMO_ACCOUNT = True  # SET True = Binance Futures Testnet (Demo) | False = Real Binance Mainnet
 
 if USE_DEMO_ACCOUNT:
     # Binance Futures Testnet URL
