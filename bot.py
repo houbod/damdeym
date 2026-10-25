@@ -11,6 +11,7 @@ FEATURES:
 - Same-Side Retry Guard & Strict Volume/ADX Filter.
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
+- Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA).
 """
 
 import sys
@@ -655,6 +656,29 @@ _stats = {
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  WEEKLY TARGET PROFIT TRACKER & LOGIC
+# ═══════════════════════════════════════════════════════════════════════════
+_weekly_pnl = 0.0
+_current_iso_year, _current_iso_week, _ = datetime.now(tz=WITA_TZ).isocalendar()
+
+def weekly_target_check() -> Tuple[bool, str]:
+    global _weekly_pnl, _current_iso_year, _current_iso_week
+    now_dt = datetime.now(tz=WITA_TZ)
+    iso_year, iso_week, _ = now_dt.isocalendar()
+
+    # Reset Otomatis di Hari Senin (Pergantian Minggu ISO)
+    if (iso_year, iso_week) != (_current_iso_year, _current_iso_week):
+        print(f"\n  🔄 [WEEKLY RESET] Berganti Minggu ({_current_iso_week} -> {iso_week}). Reset Kumulatif PnL Mingguan dari {_weekly_pnl:+.4f}U ke $0.00.")
+        _weekly_pnl = 0.0
+        _current_iso_year = iso_year
+        _current_iso_week = iso_week
+
+    target = float(ORDER_USDT)
+    if _weekly_pnl >= target:
+        return True, f"Target Mingguan Tercapai ({_weekly_pnl:+.4f}U / Target ${target:.2f}U)"
+    return False, ""
+
 # Variable Mode Logika & Lock Direction khusus Mode Inverted
 is_logic_inverted = False 
 _inverted_forced_side = None
@@ -984,7 +1008,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     if any("Absorb" in s for s in sigs): _stats["absorb_entries"] += 1
 
 def live_close(sym, reason, price=None):
-    global is_logic_inverted, _last_failed_execution_side, _inverted_forced_side
+    global is_logic_inverted, _last_failed_execution_side, _inverted_forced_side, _weekly_pnl
 
     with _lock:
         pos = live_positions.pop(sym, None)
@@ -1071,6 +1095,7 @@ def live_close(sym, reason, price=None):
     learning.add_trade(trade)
 
     _stats["pnl"] += pnl
+    _weekly_pnl += pnl
     _stats["hist"].append(pnl)
 
     if _stats["pnl"] > _stats["ath_pnl"]:
@@ -1233,8 +1258,8 @@ def print_inline():
     forced_str = f"({_inverted_forced_side})" if _inverted_forced_side else ""
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
     acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
-    print(f"       ┌ [API ENGINE v23.0 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
-    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
+    print(f"        ┌ [API ENGINE v23.0 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1249,7 +1274,7 @@ def print_full():
     print(f"\n  {'─'*72}")
     print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD ({acc_mode} | MODE: {mode_str}{forced_str}){failed_str} [{now_wita}]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
-    print(f"    PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
+    print(f"    PnL Net:{pnl:+.5f}U | Weekly PnL:{_weekly_pnl:+.5f}U / Target:${ORDER_USDT:.2f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimit:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
@@ -1276,7 +1301,7 @@ def t_slot_filler(syms):
     while True:
         try:
             slots = MAX_POSITIONS - len(live_positions)
-            if slots <= 0 or ks_check()[0]:
+            if slots <= 0 or ks_check()[0] or weekly_target_check()[0]:
                 time.sleep(SLOT_FILL_INT); continue
 
             now = time.time()
@@ -1310,7 +1335,7 @@ def t_rescan(syms):
             _rescan_q.get(timeout=5)
             time.sleep(0.05)
             slots = MAX_POSITIONS - len(live_positions)
-            if slots <= 0 or ks_check()[0]: continue
+            if slots <= 0 or ks_check()[0] or weekly_target_check()[0]: continue
 
             valid_syms = [s for s in syms if s not in live_positions]
             hot = [s for s in _hot_syms if s in valid_syms]
@@ -1408,7 +1433,8 @@ def run_bot():
     print("║  3. Inverted Lock Engine:                                          ║")
     print("║     * Loss di NORMAL (LONG)  -> DIPAKSA SHORT SAMPAI LOSS          ║")
     print("║     * Loss di NORMAL (SHORT) -> DIPAKSA LONG SAMPAI LOSS           ║")
-    print("║  4. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
+    print(f"║  4. Target Profit Mingguan = ${ORDER_USDT:.2f} (Auto Pause & Reset Senin WITA)║")
+    print("║  5. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     
     try:
@@ -1448,9 +1474,11 @@ def run_bot():
         now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S")
         guard_status = f" | Guard:[{_last_failed_execution_side}]" if _last_failed_execution_side else ""
         print(f"\n{'═'*68}")
-        print(f"  #{cycle} {now_wita} WITA | BTC_5M:{_macro['btc']} Mode:[{mode_str}{forced_str}]{guard_status} ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
+        print(f"  #{cycle} {now_wita} WITA | BTC_5M:{_macro['btc']} Mode:[{mode_str}{forced_str}]{guard_status} ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
 
-        if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
+        wk_target = weekly_target_check()
+        if wk_target[0]: print(f"  🎯 WEEKLY PAUSED: {wk_target[1]} — Menunggu Hari Senin untuk Reset OOT")
+        elif (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
         elif slots == 0: print(f"  ✅ Slots Full — Monitoring Posisi Terbuka")
         else: print(f"  🔍 Slot Kosong — Scanning Signal ({'DEMO' if USE_DEMO_ACCOUNT else 'REAL'} | Mode: {mode_str}{forced_str})...")
         if cycle % 30 == 0: print_full()
