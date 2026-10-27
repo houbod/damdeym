@@ -12,6 +12,7 @@ FEATURES:
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
 - Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA).
+- Precision Realized PnL Matching with Binance Exchange Fills.
 """
 
 import sys
@@ -1019,6 +1020,7 @@ def live_close(sym, reason, price=None):
     side = pos["side"]
     q_val = pos["qty"]
     close_side = "SELL" if side == "LONG" else "BUY"
+    close_res = None
 
     # 1. Eksekusi Market Close Order ke Binance API
     try:
@@ -1046,10 +1048,27 @@ def live_close(sym, reason, price=None):
     entry = pos["entry"]
     entry_mode = pos.get("mode", "NORMAL")
 
-    gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-    fee_rate = 0.0005
-    total_fee = (entry * q_val + price * q_val) * fee_rate
-    pnl = gross_pnl - total_fee
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  PERBAIKAN PERHITUNGAN REALIZED PNL PRESISI EXCHANGE BINANCE
+    # ═══════════════════════════════════════════════════════════════════════════
+    realized_pnl_api = 0.0
+    has_api_pnl = False
+
+    if close_res and "fills" in close_res and close_res["fills"]:
+        for fill in close_res["fills"]:
+            fill_pnl = float(fill.get("realizedPnl", 0.0))
+            fill_fee = float(fill.get("commission", 0.0))
+            realized_pnl_api += (fill_pnl - fill_fee)
+            has_api_pnl = True
+
+    if has_api_pnl:
+        pnl = realized_pnl_api
+    else:
+        # Fallback hitungan jika API tidak mengembalikan object fills
+        gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
+        fee_rate = 0.0005
+        total_fee = (entry * q_val + price * q_val) * fee_rate
+        pnl = gross_pnl - total_fee
 
     pct = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
     close_ts = time.time()
