@@ -12,7 +12,7 @@ FEATURES:
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
 - Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA).
-- Precision Realized PnL Matching with Binance Exchange Fills.
+- Precision Realized PnL Sync with Binance Trade History API.
 """
 
 import sys
@@ -1020,7 +1020,6 @@ def live_close(sym, reason, price=None):
     side = pos["side"]
     q_val = pos["qty"]
     close_side = "SELL" if side == "LONG" else "BUY"
-    close_res = None
 
     # 1. Eksekusi Market Close Order ke Binance API
     try:
@@ -1048,23 +1047,36 @@ def live_close(sym, reason, price=None):
     entry = pos["entry"]
     entry_mode = pos.get("mode", "NORMAL")
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    #  PERBAIKAN PERHITUNGAN REALIZED PNL PRESISI EXCHANGE BINANCE
-    # ═══════════════════════════════════════════════════════════════════════════
-    realized_pnl_api = 0.0
-    has_api_pnl = False
+    # 2. Sinkronisasi Realized PnL Resmi Binance dari User Trade History API
+    pnl_synced = False
+    time.sleep(0.3)  # Jeda singkat agar REST API trades Binance ter-update
+    try:
+        trades = _rest_call(
+            f"user_trades_{sym}",
+            client.futures_account_trades,
+            symbol=sym,
+            limit=5
+        )
+        if trades:
+            close_order_id = close_res.get("orderId")
+            matching_trades = []
+            if close_order_id:
+                matching_trades = [t for t in trades if int(t.get("orderId", 0)) == int(close_order_id)]
+            
+            if not matching_trades:
+                matching_trades = [trades[-1]]
+            
+            realized_pnl_sum = sum(float(t.get("realizedPnl", 0.0)) for t in matching_trades)
+            fee_sum = sum(float(t.get("commission", 0.0)) for t in matching_trades)
+            
+            # Realized PnL Net = Realized Profit - Fee Exit (Sesuai Tampilan Exchange)
+            pnl = realized_pnl_sum - fee_sum
+            pnl_synced = True
+    except Exception as e:
+        _log_err(f"sync_pnl_{sym}", e)
 
-    if close_res and "fills" in close_res and close_res["fills"]:
-        for fill in close_res["fills"]:
-            fill_pnl = float(fill.get("realizedPnl", 0.0))
-            fill_fee = float(fill.get("commission", 0.0))
-            realized_pnl_api += (fill_pnl - fill_fee)
-            has_api_pnl = True
-
-    if has_api_pnl:
-        pnl = realized_pnl_api
-    else:
-        # Fallback hitungan jika API tidak mengembalikan object fills
+    if not pnl_synced:
+        # Fallback hitungan manual jika API trades gagal dipanggil
         gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
         fee_rate = 0.0005
         total_fee = (entry * q_val + price * q_val) * fee_rate
