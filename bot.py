@@ -12,7 +12,7 @@ FEATURES:
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
 - Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA).
-- Precision Realized PnL Calculation Sync with Entry/Exit Fees.
+- Instant Warm-up Engine (Fix Cold-Start Delay).
 """
 
 import sys
@@ -1495,11 +1495,19 @@ def run_bot():
         twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
         time.sleep(0.15)
 
+    # ── STARTUP WARM-UP BUFFER (Fix Cold-Start Delay) ──────────────────────
+    print("  ⏳ Memulai Instant Warm-Up: Sinkronisasi data awal WebSocket...")
+    for s in syms[:BATCH_SIZE]:
+        _bootstrap_klines(s, Client.KLINE_INTERVAL_5MINUTE, 100)
+    time.sleep(2.5)  # Beri jeda 2.5 detik agar WebSocket terisi data riil
+
     threading.Thread(target=t_monitor, daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
     threading.Thread(target=t_macro, daemon=True).start()
-    time.sleep(2)
+
+    # Trigger scan pertama secara instant tanpa menunggu loop
+    _rescan_q.put(1)
     
     cycle = 0
     while True:
