@@ -12,7 +12,7 @@ FEATURES:
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
 - Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA).
-- Precision Realized PnL Sync with Binance Trade History API.
+- Precision Realized PnL Calculation Sync with Entry/Exit Fees.
 """
 
 import sys
@@ -1037,7 +1037,6 @@ def live_close(sym, reason, price=None):
             price = avg_close_price
     except Exception as e:
         print(f"  ❌ [API CLOSE ERROR] Gagal Tutup Posisi {side} pada {sym}: {e}")
-        # Jika gagal API close, simpan kembali posisi agar di-retry di loop monitor berikutnya
         with _lock: live_positions[sym] = pos
         return
 
@@ -1047,40 +1046,46 @@ def live_close(sym, reason, price=None):
     entry = pos["entry"]
     entry_mode = pos.get("mode", "NORMAL")
 
-    # 2. Sinkronisasi Realized PnL Resmi Binance dari User Trade History API
+    # 2. Synchronize PnL Langsung dari API Trades Binance
     pnl_synced = False
-    time.sleep(0.3)  # Jeda singkat agar REST API trades Binance ter-update
     try:
+        time.sleep(0.3)  # Tunggu jeda sinkronisasi database Binance
         trades = _rest_call(
             f"user_trades_{sym}",
             client.futures_account_trades,
             symbol=sym,
-            limit=5
+            limit=10
         )
         if trades:
-            close_order_id = close_res.get("orderId")
-            matching_trades = []
-            if close_order_id:
-                matching_trades = [t for t in trades if int(t.get("orderId", 0)) == int(close_order_id)]
+            close_order_id = int(close_res.get("orderId", -1))
+            matching_trades = [t for t in trades if int(t.get("orderId", 0)) == close_order_id]
             
-            if not matching_trades:
-                matching_trades = [trades[-1]]
-            
-            realized_pnl_sum = sum(float(t.get("realizedPnl", 0.0)) for t in matching_trades)
-            fee_sum = sum(float(t.get("commission", 0.0)) for t in matching_trades)
-            
-            # Realized PnL Net = Realized Profit - Fee Exit (Sesuai Tampilan Exchange)
-            pnl = realized_pnl_sum - fee_sum
-            pnl_synced = True
+            if matching_trades:
+                realized_pnl_sum = sum(float(t.get("realizedPnl", 0.0)) for t in matching_trades)
+                fee_sum = sum(float(t.get("commission", 0.0)) for t in matching_trades)
+                
+                # Cari fee entry dari transaksi pembuka
+                open_order_id = int(pos.get("order_id", -1))
+                open_trades = [t for t in trades if int(t.get("orderId", 0)) == open_order_id]
+                entry_fee_sum = sum(float(t.get("commission", 0.0)) for t in open_trades) if open_trades else (entry * q_val * 0.0004)
+
+                # PnL Bersih Total = Realized PnL Binance - Fee Exit - Fee Entry
+                pnl = realized_pnl_sum - fee_sum - entry_fee_sum
+                pnl_synced = True
     except Exception as e:
         _log_err(f"sync_pnl_{sym}", e)
 
     if not pnl_synced:
-        # Fallback hitungan manual jika API trades gagal dipanggil
-        gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-        fee_rate = 0.0005
-        total_fee = (entry * q_val + price * q_val) * fee_rate
-        pnl = gross_pnl - total_fee
+        # 3. Precision Fallback Calculation jika API Trades Binance lambat
+        if side == "LONG":
+            gross_pnl = (price - entry) * q_val
+        else: # SHORT
+            gross_pnl = (entry - price) * q_val
+
+        # Menghitung Fee Entry + Exit (Standar Taker Fee 0.04% - 0.05%)
+        fee_entry = (entry * q_val) * 0.0004
+        fee_exit = (price * q_val) * 0.0004
+        pnl = gross_pnl - (fee_entry + fee_exit)
 
     pct = ((price - entry) / entry * 100) if side == "LONG" else ((entry - price) / entry * 100)
     close_ts = time.time()
