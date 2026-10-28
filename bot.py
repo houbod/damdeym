@@ -1,6 +1,6 @@
 """
 Bot Scalping v23.0 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
-====================================================================
+===================================================================
 FEATURES:
 - Real API Execution (Market Entry + Market Stop Loss + Market Take Profit Order).
 - Switchable Mode: Toggle USE_DEMO_ACCOUNT = True (Testnet) / False (Real Mainnet).
