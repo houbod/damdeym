@@ -11,7 +11,7 @@ FEATURES:
 - Same-Side Retry Guard & Strict Volume/ADX Filter.
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
-- Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA).
+- Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA & Auto ActivePos Cleanup).
 - Instant Warm-up Engine (Fix Cold-Start Delay).
 """
 
@@ -52,11 +52,9 @@ api_secret = os.getenv("API_SECRET")
 USE_DEMO_ACCOUNT = True  # SET True = Binance Futures Testnet (Demo) | False = Real Binance Mainnet
 
 if USE_DEMO_ACCOUNT:
-    # Binance Futures Testnet URL
     client = Client(api_key, api_secret, testnet=True)
     client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 else:
-    # Binance Futures Real Mainnet URL
     client = Client(api_key, api_secret)
     client.FUTURES_URL = "https://fapi.binance.com/fapi"
 
@@ -658,7 +656,7 @@ _stats = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  WEEKLY TARGET PROFIT TRACKER & LOGIC
+#  WEEKLY TARGET PROFIT TRACKER & LOGIC (FIXED ACTIVEPOS CLEAR)
 # ═══════════════════════════════════════════════════════════════════════════
 _weekly_pnl = 0.0
 _current_iso_year, _current_iso_week, _ = datetime.now(tz=WITA_TZ).isocalendar()
@@ -677,7 +675,11 @@ def weekly_target_check() -> Tuple[bool, str]:
 
     target = float(ORDER_USDT)
     if _weekly_pnl >= target:
-        return True, f"Target Mingguan Tercapai ({_weekly_pnl:+.4f}U / Target ${target:.2f}U)"
+        # PEMBERSIHAN OTOMATIS: Bersihkan live_positions lokal agar ActivePos kembali ke (0/1)
+        with _lock:
+            if live_positions:
+                live_positions.clear()
+        return True, f"Target Mingguan Tercapai (+{_weekly_pnl:.4f}U / Target ${target:.2f}U)"
     return False, ""
 
 # Variable Mode Logika & Lock Direction khusus Mode Inverted
@@ -911,11 +913,16 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  REAL API BINANCE EXECUTION ENGINE (OPEN & CLOSE POSITIONS)
+#  REAL API BINANCE EXECUTION ENGINE (GUARDED LIVE OPEN & CLOSE)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
     global is_logic_inverted, _inverted_forced_side
+
+    # GUARD STRICT: Tolak pembukaan posisi jika Target Mingguan sudah tercapai
+    is_paused, _ = weekly_target_check()
+    if is_paused:
+        return
 
     if orig_direction not in ("LONG", "SHORT"):
         return
@@ -961,7 +968,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             quantity=q_val
         )
         
-        # Ambil harga eksekusi aktual dari respon Binance
         avg_price = float(order_res.get("avgPrice", 0.0))
         if avg_price > 0:
             price = avg_price
@@ -1049,7 +1055,7 @@ def live_close(sym, reason, price=None):
     # 2. Synchronize PnL Langsung dari API Trades Binance
     pnl_synced = False
     try:
-        time.sleep(0.3)  # Tunggu jeda sinkronisasi database Binance
+        time.sleep(0.3)
         trades = _rest_call(
             f"user_trades_{sym}",
             client.futures_account_trades,
@@ -1064,25 +1070,21 @@ def live_close(sym, reason, price=None):
                 realized_pnl_sum = sum(float(t.get("realizedPnl", 0.0)) for t in matching_trades)
                 fee_sum = sum(float(t.get("commission", 0.0)) for t in matching_trades)
                 
-                # Cari fee entry dari transaksi pembuka
                 open_order_id = int(pos.get("order_id", -1))
                 open_trades = [t for t in trades if int(t.get("orderId", 0)) == open_order_id]
                 entry_fee_sum = sum(float(t.get("commission", 0.0)) for t in open_trades) if open_trades else (entry * q_val * 0.0004)
 
-                # PnL Bersih Total = Realized PnL Binance - Fee Exit - Fee Entry
                 pnl = realized_pnl_sum - fee_sum - entry_fee_sum
                 pnl_synced = True
     except Exception as e:
         _log_err(f"sync_pnl_{sym}", e)
 
     if not pnl_synced:
-        # 3. Precision Fallback Calculation jika API Trades Binance lambat
         if side == "LONG":
             gross_pnl = (price - entry) * q_val
-        else: # SHORT
+        else:
             gross_pnl = (entry - price) * q_val
 
-        # Menghitung Fee Entry + Exit (Standar Taker Fee 0.04% - 0.05%)
         fee_entry = (entry * q_val) * 0.0004
         fee_exit = (price * q_val) * 0.0004
         pnl = gross_pnl - (fee_entry + fee_exit)
@@ -1096,10 +1098,7 @@ def live_close(sym, reason, price=None):
     close_wita = datetime.fromtimestamp(close_ts, tz=WITA_TZ).strftime("%H:%M:%S")
     open_wita = pos.get("open_time_wita", datetime.fromtimestamp(pos["open_time"], tz=WITA_TZ).strftime("%H:%M:%S"))
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    #  LOGIKA INVERTED DIRECTION LOCK & TOGGLE
-    # ═══════════════════════════════════════════════════════════════════════════
-    if not won:  # Loss (SL atau TIME_LIMIT pnl < 0)
+    if not won:
         _last_failed_execution_side = side
 
         if not is_logic_inverted:
@@ -1181,7 +1180,6 @@ def monitor_positions():
             if px <= tp_px: live_close(sym, "TP", tp_px); continue
             if px >= sl_px: live_close(sym, "SL", sl_px); continue
 
-        # Time Limit Check
         if hold_time > MAX_HOLD_SECONDS:
             print(f"  ⏰ {sym}: MAX_HOLD_SECONDS terlampaui ({hold_time:.0f}s) — TIME_LIMIT close")
             live_close(sym, "TIME_LIMIT", px)
@@ -1239,7 +1237,7 @@ def scan_one(sym):
 
             if score < required_score or adx_val < 25.0 or not trend_aligned:
                 _stats["same_side_veto"] += 1
-                return None  # VETO
+                return None
 
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -1499,14 +1497,13 @@ def run_bot():
     print("  ⏳ Memulai Instant Warm-Up: Sinkronisasi data awal WebSocket...")
     for s in syms[:BATCH_SIZE]:
         _bootstrap_klines(s, Client.KLINE_INTERVAL_5MINUTE, 100)
-    time.sleep(2.5)  # Beri jeda 2.5 detik agar WebSocket terisi data riil
+    time.sleep(2.5)
 
     threading.Thread(target=t_monitor, daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
     threading.Thread(target=t_macro, daemon=True).start()
 
-    # Trigger scan pertama secara instant tanpa menunggu loop
     _rescan_q.put(1)
     
     cycle = 0
