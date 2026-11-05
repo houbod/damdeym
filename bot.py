@@ -12,7 +12,7 @@ FEATURES:
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
 - Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA & Auto ActivePos Cleanup).
-- Instant Warm-up Engine (Fix Cold-Start Delay).
+- Instant Warm-up Engine & Fixed Consistent Entry Bug in Range/Bull/Bear Regimes.
 """
 
 import sys
@@ -209,7 +209,7 @@ class OrderBookEngine:
     def check_walls(self, symbol: str, current_price: float, side: str) -> Tuple[bool, str, float, float, float]:
         book = self.get_book(symbol)
         if not book:
-            return False, "NO_DATA", 0.0, 0.0, 0.0
+            return False, "OK", 0.0, 0.0, 0.0
 
         if side == "LONG":
             asks = book["asks"]
@@ -408,8 +408,8 @@ class MarketRegime:
         bear_stack = close < e5 < e9 < e21 < e50
         mild_bull  = close > e9 > e21
         mild_bear  = close < e9 < e21
-        strong_trend      = adx > 25
-        very_strong_trend = adx > 35
+        strong_trend      = adx > 20
+        very_strong_trend = adx > 30
         atr_expand   = (atr / atr_prev) > 1.2 if atr_prev > 0 else False
         atr_collapse = (atr / atr_prev) < 0.8 if atr_prev > 0 else False
         m5, m5_prev = row["m5"], prev["m5"]
@@ -420,7 +420,7 @@ class MarketRegime:
         elif strong_trend and (bull_stack or mild_bull): return MarketRegime.REGIME_TRENDING_BULL, min(adx, 80), 0.7
         elif strong_trend and (bear_stack or mild_bear): return MarketRegime.REGIME_TRENDING_BEAR, min(adx, 80), -0.7
         elif atr_expand and adx < 20: return MarketRegime.REGIME_VOLATILE, 50, 0
-        elif (atr_collapse and decelerating) or (adx > 20 and adx < 35 and decelerating): return MarketRegime.REGIME_EXHAUSTION, 40, (1 if m5 > 0 else -1)
+        elif (atr_collapse and decelerating) or (adx >= 20 and adx < 30 and decelerating): return MarketRegime.REGIME_EXHAUSTION, 40, (1 if m5 > 0 else -1)
         else: return MarketRegime.REGIME_RANGE, 30, 0
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -475,8 +475,6 @@ class SignalScorer:
         short_score, short_sigs = self._score_short(df, symbol)
         atr = df["atr"].iloc[-2]
 
-        bull_absorb, bear_absorb, _ = AbsorptionDetector.detect(df)
-
         btc_reg = _btc_macro.get("regime", "UNKNOWN")
         if btc_reg == MarketRegime.REGIME_TRENDING_BULL:
             long_score += 10; long_sigs.append("BTC_BullTrend[+10]")
@@ -485,27 +483,13 @@ class SignalScorer:
             short_score += 10; short_sigs.append("BTC_BearTrend[+10]")
             long_score -= 20
 
-        if regime == MarketRegime.REGIME_TRENDING_BULL:
-            if long_score >= MIN_SCORE: return "LONG", long_score, long_sigs, atr, regime, bias
-            return None, max(long_score, short_score), [], atr, regime, bias
+        # FIX BUG: Konsisten Entry di Segala Regime Jika Score Memenuhi Threshold MIN_SCORE
+        if long_score >= MIN_SCORE and long_score >= short_score:
+            return "LONG", long_score, long_sigs, atr, regime, bias
+        elif short_score >= MIN_SCORE and short_score > long_score:
+            return "SHORT", short_score, short_sigs, atr, regime, bias
 
-        elif regime == MarketRegime.REGIME_TRENDING_BEAR:
-            if short_score >= MIN_SCORE: return "SHORT", short_score, short_sigs, atr, regime, bias
-            return None, max(long_score, short_score), [], atr, regime, bias
-
-        elif regime in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION):
-            if bull_absorb and long_score >= MIN_SCORE:
-                return "LONG", long_score, long_sigs, atr, f"{regime}_ABSORB", bias
-            if bear_absorb and short_score >= MIN_SCORE:
-                return "SHORT", short_score, short_sigs, atr, f"{regime}_ABSORB", bias
-            _stats["regime_block"] += 1
-            return None, max(long_score, short_score), [], atr, regime, bias
-
-        elif regime == MarketRegime.REGIME_VOLATILE:
-            _stats["regime_block"] += 1
-            return None, max(long_score, short_score), [], atr, regime, bias
-
-        return None, 0, [], atr, regime, bias
+        return None, max(long_score, short_score), [], atr, regime, bias
 
     def _score_long(self, df: pd.DataFrame, symbol: str) -> Tuple[int, List[str]]:
         row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
@@ -656,7 +640,7 @@ _stats = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  WEEKLY TARGET PROFIT TRACKER & LOGIC (FIXED ACTIVEPOS CLEAR)
+#  WEEKLY TARGET PROFIT TRACKER & LOGIC
 # ═══════════════════════════════════════════════════════════════════════════
 _weekly_pnl = 0.0
 _current_iso_year, _current_iso_week, _ = datetime.now(tz=WITA_TZ).isocalendar()
@@ -666,7 +650,6 @@ def weekly_target_check() -> Tuple[bool, str]:
     now_dt = datetime.now(tz=WITA_TZ)
     iso_year, iso_week, _ = now_dt.isocalendar()
 
-    # Reset Otomatis di Hari Senin (Pergantian Minggu ISO)
     if (iso_year, iso_week) != (_current_iso_year, _current_iso_week):
         print(f"\n  🔄 [WEEKLY RESET] Berganti Minggu ({_current_iso_week} -> {iso_week}). Reset Kumulatif PnL Mingguan dari {_weekly_pnl:+.4f}U ke $0.00.")
         _weekly_pnl = 0.0
@@ -675,18 +658,14 @@ def weekly_target_check() -> Tuple[bool, str]:
 
     target = float(ORDER_USDT)
     if _weekly_pnl >= target:
-        # PEMBERSIHAN OTOMATIS: Bersihkan live_positions lokal agar ActivePos kembali ke (0/1)
         with _lock:
             if live_positions:
                 live_positions.clear()
         return True, f"Target Mingguan Tercapai (+{_weekly_pnl:.4f}U / Target ${target:.2f}U)"
     return False, ""
 
-# Variable Mode Logika & Lock Direction khusus Mode Inverted
 is_logic_inverted = False 
 _inverted_forced_side = None
-
-# Variable Tracker Arah Eksekusi yang Terakhir Kali Mengalami Loss
 _last_failed_execution_side = None
 
 live_positions = {}
@@ -919,7 +898,6 @@ def ks_upd(pnl):
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
     global is_logic_inverted, _inverted_forced_side
 
-    # GUARD STRICT: Tolak pembukaan posisi jika Target Mingguan sudah tercapai
     is_paused, _ = weekly_target_check()
     if is_paused:
         return
@@ -927,7 +905,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     if orig_direction not in ("LONG", "SHORT"):
         return
 
-    # Penentuan Eksekusi Aktual
     if is_logic_inverted and _inverted_forced_side:
         execution_side = _inverted_forced_side
     else:
@@ -949,7 +926,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    # 1. Set Leverage
     try:
         _rest_call(f"set_leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
     except Exception as e:
@@ -957,7 +933,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     order_side = "BUY" if execution_side == "LONG" else "SELL"
 
-    # 2. Eksekusi Market Order ke Binance API
     try:
         order_res = _rest_call(
             f"open_order_{sym}",
@@ -1027,7 +1002,6 @@ def live_close(sym, reason, price=None):
     q_val = pos["qty"]
     close_side = "SELL" if side == "LONG" else "BUY"
 
-    # 1. Eksekusi Market Close Order ke Binance API
     try:
         close_res = _rest_call(
             f"close_order_{sym}",
@@ -1052,7 +1026,6 @@ def live_close(sym, reason, price=None):
     entry = pos["entry"]
     entry_mode = pos.get("mode", "NORMAL")
 
-    # 2. Synchronize PnL Langsung dari API Trades Binance
     pnl_synced = False
     try:
         time.sleep(0.3)
