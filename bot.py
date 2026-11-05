@@ -1,14 +1,18 @@
 """
-Bot Scalping v23.1 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
+Bot Scalping v23.0 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
 ====================================================================
 FEATURES:
 - Real API Execution (Market Entry + Market Stop Loss + Market Take Profit Order).
-- Adaptive Sideway Filter (Optimized VolVeto & ADX parameters for Range Markets).
 - Switchable Mode: Toggle USE_DEMO_ACCOUNT = True (Testnet) / False (Real Mainnet).
-- Inverted Direction Lock Engine.
+- Inverted Direction Lock Engine:
+  * Loss di NORMAL (LONG)  -> Mode INVERTED DIPAKSA HANYA SHORT sampai Loss.
+  * Loss di NORMAL (SHORT) -> Mode INVERTED DIPAKSA HANYA LONG sampai Loss.
+  * Loss di INVERTED       -> Kembali ke NORMAL (Arah Bebas Sesuai Sinyal).
+- Same-Side Retry Guard & Strict Volume/ADX Filter.
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
-- Dynamic Weekly Cumulative Profit Target.
+- Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA & Auto ActivePos Cleanup).
+- Instant Warm-up Engine (Fix Cold-Start Delay).
 """
 
 import sys
@@ -43,7 +47,7 @@ api_key = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ACCOUNT CONFIGURATION
+#  ACCOUNT CONFIGURATION (PILIH DEMO ATAU REAL)
 # ═══════════════════════════════════════════════════════════════════════════
 USE_DEMO_ACCOUNT = True  # SET True = Binance Futures Testnet (Demo) | False = Real Binance Mainnet
 
@@ -58,6 +62,7 @@ WS_MAX_QUEUE_SIZE = 2000
 DEPTH_SOCKET_CHUNK = 8
 MARK_PRICE_FAST = False
 
+# Definisi Zona Waktu Makassar (WITA / UTC+8)
 WITA_TZ = timezone(timedelta(hours=8))
 
 def _create_twm():
@@ -80,17 +85,17 @@ def _create_twm():
 twm = _create_twm()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION & INSTITUTIONAL PARAMETERS (OPTIMIZED)
+#  CONFIGURATION & INSTITUTIONAL PARAMETERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 LEVERAGE      = 20
-ORDER_USDT    = 6.0
+ORDER_USDT    = 3.0
 MAX_POSITIONS = 1
 
-# Adaptive Volume & Sideway Filters (Disesuaikan agar tidak memicu VolVeto berlebih)
-MIN_VOLUME_RATIO = 0.65   # Didesain ulang dari 0.85 -> 0.65
-MIN_ADX_TREND    = 15.0   # Didesain ulang dari 20.0 -> 15.0 (mengakomodasi market RANGE)
-MIN_ATR_PCT      = 0.0015 # Volatilitas minimal 0.15%
+# Strict Volume & Sideway Filters
+MIN_VOLUME_RATIO = 0.85   # Volume minimal 85% dari rata-rata 20 candle
+MIN_ADX_TREND    = 20.0   # ADX minimal 20 (mengabaikan market mati/sideway)
+MIN_ATR_PCT      = 0.003  # Volatilitas minimal 0.3% agar ada pergerakan
 
 # Scanning & Concurrency
 SCAN_INTERVAL = 2.0
@@ -107,8 +112,8 @@ REST_418_COOLDOWN = 900.0
 REST_RETRIES = 2
 
 # Scoring & Risk
-MIN_SCORE                  = 48   # Diturunkan dari 58 -> 48 agar lebih cepat memicu entry
-SAME_SIDE_EXTRA_SCORE      = 10   
+MIN_SCORE                  = 58   
+SAME_SIDE_EXTRA_SCORE      = 12   
 ATR_TP_RESTORED_MULTIPLIER = 3.5
 ATR_SL_RESTORED_MULTIPLIER = 1.8
 
@@ -116,8 +121,9 @@ MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
 MIN_SL_PCT        = 0.015
 MAX_SL_PCT        = 0.025
-MAX_HOLD_SECONDS  = 6120   
+MAX_HOLD_SECONDS  = 6120   # Batas maksimal tahan posisi (1 jam 42 menit)
 
+# Institutional Order Book
 WALL_RATIO_THRESHOLD  = 2.5
 WALL_DEPTH_PCT        = 0.35
 WALL_PROXIMITY_PCT    = 0.005
@@ -125,11 +131,13 @@ IMBALANCE_STRONG_BULL = 0.25
 IMBALANCE_STRONG_BEAR = -0.25
 SPOOF_DROP_THRESHOLD  = 0.40
 
+# Macro BTC Correlation
 BTC_CRASH_THRESHOLD  = -0.003
 BTC_PUMP_THRESHOLD   = 0.003
 BTC_WINDOW_SEC       = 8.0
 BTC_BREAKER_COOLDOWN = 120.0
 
+# Kill Switch
 DAILY_LOSS   = -20.0
 CONSEC_MAX   = 15
 CONSEC_PAUSE = 10
@@ -326,7 +334,7 @@ class AbsorptionDetector:
         if df is None or len(df) < 25: return False, False, ""
         row = df.iloc[-2]
         
-        vol_spike = row.get("vr", 1.0) >= 1.2
+        vol_spike = row.get("vr", 1.0) >= 1.4
         rng = row.get("rng", 1.0)
         low = row.get("low", 0.0)
         high = row.get("high", 0.0)
@@ -336,14 +344,14 @@ class AbsorptionDetector:
         lw_ratio = row.get("lower_wick_ratio", 0.0)
         uw_ratio = row.get("upper_wick_ratio", 0.0)
 
-        heavy_seller = (delta_ratio < -0.15) or (buy_ratio < 0.42)
-        wick_bull = lw_ratio >= 0.35
-        close_held_bull = close >= (low + 0.40 * rng)
+        heavy_seller = (delta_ratio < -0.20) or (buy_ratio < 0.40)
+        wick_bull = lw_ratio >= 0.38
+        close_held_bull = close >= (low + 0.45 * rng)
         bull_absorb = vol_spike and heavy_seller and (wick_bull or close_held_bull)
 
-        heavy_buyer = (delta_ratio > 0.15) or (buy_ratio > 0.58)
-        wick_bear = uw_ratio >= 0.35
-        close_held_bear = close <= (high - 0.40 * rng)
+        heavy_buyer = (delta_ratio > 0.20) or (buy_ratio > 0.60)
+        wick_bear = uw_ratio >= 0.38
+        close_held_bear = close <= (high - 0.45 * rng)
         bear_absorb = vol_spike and heavy_buyer and (wick_bear or close_held_bear)
 
         details = []
@@ -367,7 +375,7 @@ class DynamicRiskManager:
         if execution_side == "LONG":
             tp_price = entry_price * (1 + tp_pct)
             sl_price = entry_price * (1 - sl_pct)
-        else:
+        else: # SHORT
             tp_price = entry_price * (1 - tp_pct)
             sl_price = entry_price * (1 + sl_pct)
 
@@ -400,8 +408,8 @@ class MarketRegime:
         bear_stack = close < e5 < e9 < e21 < e50
         mild_bull  = close > e9 > e21
         mild_bear  = close < e9 < e21
-        strong_trend      = adx > 22
-        very_strong_trend = adx > 32
+        strong_trend      = adx > 25
+        very_strong_trend = adx > 35
         atr_expand   = (atr / atr_prev) > 1.2 if atr_prev > 0 else False
         atr_collapse = (atr / atr_prev) < 0.8 if atr_prev > 0 else False
         m5, m5_prev = row["m5"], prev["m5"]
@@ -411,12 +419,12 @@ class MarketRegime:
         elif very_strong_trend and bear_stack: return MarketRegime.REGIME_TRENDING_BEAR, min(adx, 100), -1.0
         elif strong_trend and (bull_stack or mild_bull): return MarketRegime.REGIME_TRENDING_BULL, min(adx, 80), 0.7
         elif strong_trend and (bear_stack or mild_bear): return MarketRegime.REGIME_TRENDING_BEAR, min(adx, 80), -0.7
-        elif atr_expand and adx < 15: return MarketRegime.REGIME_VOLATILE, 50, 0
-        elif (atr_collapse and decelerating) or (adx > 15 and adx < 32 and decelerating): return MarketRegime.REGIME_EXHAUSTION, 40, (1 if m5 > 0 else -1)
+        elif atr_expand and adx < 20: return MarketRegime.REGIME_VOLATILE, 50, 0
+        elif (atr_collapse and decelerating) or (adx > 20 and adx < 35 and decelerating): return MarketRegime.REGIME_EXHAUSTION, 40, (1 if m5 > 0 else -1)
         else: return MarketRegime.REGIME_RANGE, 30, 0
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCORING ENGINE (ADAPTIVE RANGE ENTRY)
+#  SCORING ENGINE
 # ═══════════════════════════════════════════════════════════════════════════
 
 class SignalWeights:
@@ -467,23 +475,37 @@ class SignalScorer:
         short_score, short_sigs = self._score_short(df, symbol)
         atr = df["atr"].iloc[-2]
 
+        bull_absorb, bear_absorb, _ = AbsorptionDetector.detect(df)
+
         btc_reg = _btc_macro.get("regime", "UNKNOWN")
         if btc_reg == MarketRegime.REGIME_TRENDING_BULL:
             long_score += 10; long_sigs.append("BTC_BullTrend[+10]")
-            short_score -= 15
+            short_score -= 20
         elif btc_reg == MarketRegime.REGIME_TRENDING_BEAR:
             short_score += 10; short_sigs.append("BTC_BearTrend[+10]")
-            long_score -= 15
+            long_score -= 20
 
-        if regime in (MarketRegime.REGIME_TRENDING_BULL, MarketRegime.REGIME_RANGE):
-            if long_score >= MIN_SCORE and long_score > short_score:
-                return "LONG", long_score, long_sigs, atr, regime, bias
+        if regime == MarketRegime.REGIME_TRENDING_BULL:
+            if long_score >= MIN_SCORE: return "LONG", long_score, long_sigs, atr, regime, bias
+            return None, max(long_score, short_score), [], atr, regime, bias
 
-        if regime in (MarketRegime.REGIME_TRENDING_BEAR, MarketRegime.REGIME_RANGE):
-            if short_score >= MIN_SCORE and short_score > long_score:
-                return "SHORT", short_score, short_sigs, atr, regime, bias
+        elif regime == MarketRegime.REGIME_TRENDING_BEAR:
+            if short_score >= MIN_SCORE: return "SHORT", short_score, short_sigs, atr, regime, bias
+            return None, max(long_score, short_score), [], atr, regime, bias
 
-        return None, max(long_score, short_score), [], atr, regime, bias
+        elif regime in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION):
+            if bull_absorb and long_score >= MIN_SCORE:
+                return "LONG", long_score, long_sigs, atr, f"{regime}_ABSORB", bias
+            if bear_absorb and short_score >= MIN_SCORE:
+                return "SHORT", short_score, short_sigs, atr, f"{regime}_ABSORB", bias
+            _stats["regime_block"] += 1
+            return None, max(long_score, short_score), [], atr, regime, bias
+
+        elif regime == MarketRegime.REGIME_VOLATILE:
+            _stats["regime_block"] += 1
+            return None, max(long_score, short_score), [], atr, regime, bias
+
+        return None, 0, [], atr, regime, bias
 
     def _score_long(self, df: pd.DataFrame, symbol: str) -> Tuple[int, List[str]]:
         row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
@@ -494,16 +516,16 @@ class SignalScorer:
         elif p > e5 > e9 > e21: w = self.weights.get_adjusted_weight("ema_mild_bull"); score += w; signals.append(f"EMA4↑[{w:.0f}]")
         elif p > e5 > e9: w = self.weights.get_adjusted_weight("ema_weak_bull"); score += w; signals.append(f"EMA3↑[{w:.0f}]")
 
-        if row["m5"] > 0.002: w = self.weights.get_adjusted_weight("mom_strong"); score += w; signals.append(f"Mom+{row['m5']*100:.1f}%↑[{w:.0f}]")
-        elif row["m5"] > 0.001: w = self.weights.get_adjusted_weight("mom_moderate"); score += w; signals.append(f"Mom+{row['m5']*100:.1f}%↑[{w:.0f}]")
+        if row["m5"] > 0.003: w = self.weights.get_adjusted_weight("mom_strong"); score += w; signals.append(f"Mom+{row['m5']*100:.1f}%↑[{w:.0f}]")
+        elif row["m5"] > 0.0015: w = self.weights.get_adjusted_weight("mom_moderate"); score += w; signals.append(f"Mom+{row['m5']*100:.1f}%↑[{w:.0f}]")
 
         if prev["mh"] <= 0 and row["mh"] > 0: w = self.weights.get_adjusted_weight("macd_cross_up"); score += w; signals.append(f"MACD_X↑[{w:.0f}]")
         elif row["mh"] > 0 and row["mh"] > prev["mh"] > prev2["mh"]: w = self.weights.get_adjusted_weight("macd_strengthen"); score += w; signals.append(f"MACD↑↑[{w:.0f}]")
 
         delta_ratio = row.get("delta_ratio", 0.0)
         buy_ratio = row.get("br", 0.5)
-        if delta_ratio > 0.15: w = self.weights.get_adjusted_weight("orderflow_delta_bull"); score += w; signals.append(f"ΔBuy+{delta_ratio*100:.0f}%[{w:.0f}]")
-        elif buy_ratio > 0.52: w = self.weights.get_adjusted_weight("orderflow_buy_high"); score += w; signals.append(f"TakerBuy{buy_ratio*100:.0f}%[{w:.0f}]")
+        if delta_ratio > 0.20: w = self.weights.get_adjusted_weight("orderflow_delta_bull"); score += w; signals.append(f"ΔBuy+{delta_ratio*100:.0f}%[{w:.0f}]")
+        elif buy_ratio > 0.55: w = self.weights.get_adjusted_weight("orderflow_buy_high"); score += w; signals.append(f"TakerBuy{buy_ratio*100:.0f}%[{w:.0f}]")
 
         bull_abs, _, _ = AbsorptionDetector.detect(df)
         if bull_abs:
@@ -514,7 +536,8 @@ class SignalScorer:
             if imb > IMBALANCE_STRONG_BULL:
                 w = self.weights.get_adjusted_weight("orderbook_imbalance_bull"); score += w; signals.append(f"BAI+{imb*100:.0f}%[{w:.0f}]")
 
-        if 45 <= row["rsi"] <= 68: w = self.weights.get_adjusted_weight("rsi_bull_flow"); score += w; signals.append(f"RSI{row['rsi']:.0f}[{w:.0f}]")
+        if 48 <= row["rsi"] <= 68: w = self.weights.get_adjusted_weight("rsi_bull_flow"); score += w; signals.append(f"RSI{row['rsi']:.0f}[{w:.0f}]")
+        elif row["rsi"] > 68: w = self.weights.get_adjusted_weight("rsi_extreme_ob"); score += w; signals.append(f"RSI{row['rsi']:.0f}OB[{w:.0f}]")
 
         return score, signals
 
@@ -527,16 +550,16 @@ class SignalScorer:
         elif p < e5 < e9 < e21: w = self.weights.get_adjusted_weight("ema_mild_bear"); score += w; signals.append(f"EMA4↓[{w:.0f}]")
         elif p < e5 < e9: w = self.weights.get_adjusted_weight("ema_weak_bear"); score += w; signals.append(f"EMA3↓[{w:.0f}]")
 
-        if row["m5"] < -0.002: w = self.weights.get_adjusted_weight("mom_strong_neg"); score += w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
-        elif row["m5"] < -0.001: w = self.weights.get_adjusted_weight("mom_moderate_neg"); score += w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
+        if row["m5"] < -0.003: w = self.weights.get_adjusted_weight("mom_strong_neg"); score += w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
+        elif row["m5"] < -0.0015: w = self.weights.get_adjusted_weight("mom_moderate_neg"); score += w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
 
         if prev["mh"] >= 0 and row["mh"] < 0: w = self.weights.get_adjusted_weight("macd_cross_down"); score += w; signals.append(f"MACD_X↓[{w:.0f}]")
         elif row["mh"] < 0 and row["mh"] < prev["mh"] < prev2["mh"]: w = self.weights.get_adjusted_weight("macd_strengthen_neg"); score += w; signals.append(f"MACD↓↓[{w:.0f}]")
 
         delta_ratio = row.get("delta_ratio", 0.0)
         buy_ratio = row.get("br", 0.5)
-        if delta_ratio < -0.15: w = self.weights.get_adjusted_weight("orderflow_delta_bear"); score += w; signals.append(f"ΔSell{delta_ratio*100:.0f}%[{w:.0f}]")
-        elif buy_ratio < 0.48: w = self.weights.get_adjusted_weight("orderflow_sell_high"); score += w; signals.append(f"TakerSell{(1-buy_ratio)*100:.0f}%[{w:.0f}]")
+        if delta_ratio < -0.20: w = self.weights.get_adjusted_weight("orderflow_delta_bear"); score += w; signals.append(f"ΔSell{delta_ratio*100:.0f}%[{w:.0f}]")
+        elif buy_ratio < 0.45: w = self.weights.get_adjusted_weight("orderflow_sell_high"); score += w; signals.append(f"TakerSell{(1-buy_ratio)*100:.0f}%[{w:.0f}]")
 
         _, bear_abs, _ = AbsorptionDetector.detect(df)
         if bear_abs:
@@ -547,7 +570,8 @@ class SignalScorer:
             if imb < IMBALANCE_STRONG_BEAR:
                 w = self.weights.get_adjusted_weight("orderbook_imbalance_bear"); score += w; signals.append(f"BAI{imb*100:.0f}%[{w:.0f}]")
 
-        if 32 <= row["rsi"] <= 55: w = self.weights.get_adjusted_weight("rsi_bear_flow"); score += w; signals.append(f"RSI{row['rsi']:.0f}[{w:.0f}]")
+        if 32 <= row["rsi"] <= 52: w = self.weights.get_adjusted_weight("rsi_bear_flow"); score += w; signals.append(f"RSI{row['rsi']:.0f}[{w:.0f}]")
+        elif row["rsi"] < 32: w = self.weights.get_adjusted_weight("rsi_extreme_os"); score += w; signals.append(f"RSI{row['rsi']:.0f}OS[{w:.0f}]")
 
         return score, signals
 
@@ -593,6 +617,13 @@ class LearningLayer:
         self.signal_weights.record_outcome(trade.signals, trade.won)
         if len(self.trades) > 1000: self.trades = self.trades[-500:]
 
+    def avg_win(self) -> float:
+        wins = [t.pnl for t in self.trades if t.won]
+        return sum(wins) / len(wins) if wins else 0.0
+    def avg_loss(self) -> float:
+        losses = [abs(t.pnl) for t in self.trades if not t.won]
+        return sum(losses) / len(losses) if losses else 0.0
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  GLOBAL STATE & UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
@@ -624,6 +655,9 @@ _stats = {
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  WEEKLY TARGET PROFIT TRACKER & LOGIC (FIXED ACTIVEPOS CLEAR)
+# ═══════════════════════════════════════════════════════════════════════════
 _weekly_pnl = 0.0
 _current_iso_year, _current_iso_week, _ = datetime.now(tz=WITA_TZ).isocalendar()
 
@@ -632,6 +666,7 @@ def weekly_target_check() -> Tuple[bool, str]:
     now_dt = datetime.now(tz=WITA_TZ)
     iso_year, iso_week, _ = now_dt.isocalendar()
 
+    # Reset Otomatis di Hari Senin (Pergantian Minggu ISO)
     if (iso_year, iso_week) != (_current_iso_year, _current_iso_week):
         print(f"\n  🔄 [WEEKLY RESET] Berganti Minggu ({_current_iso_week} -> {iso_week}). Reset Kumulatif PnL Mingguan dari {_weekly_pnl:+.4f}U ke $0.00.")
         _weekly_pnl = 0.0
@@ -640,14 +675,18 @@ def weekly_target_check() -> Tuple[bool, str]:
 
     target = float(ORDER_USDT)
     if _weekly_pnl >= target:
+        # PEMBERSIHAN OTOMATIS: Bersihkan live_positions lokal agar ActivePos kembali ke (0/1)
         with _lock:
             if live_positions:
                 live_positions.clear()
         return True, f"Target Mingguan Tercapai (+{_weekly_pnl:.4f}U / Target ${target:.2f}U)"
     return False, ""
 
+# Variable Mode Logika & Lock Direction khusus Mode Inverted
 is_logic_inverted = False 
 _inverted_forced_side = None
+
+# Variable Tracker Arah Eksekusi yang Terakhir Kali Mengalami Loss
 _last_failed_execution_side = None
 
 live_positions = {}
@@ -874,12 +913,13 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  REAL API BINANCE EXECUTION ENGINE
+#  REAL API BINANCE EXECUTION ENGINE (GUARDED LIVE OPEN & CLOSE)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
     global is_logic_inverted, _inverted_forced_side
 
+    # GUARD STRICT: Tolak pembukaan posisi jika Target Mingguan sudah tercapai
     is_paused, _ = weekly_target_check()
     if is_paused:
         return
@@ -887,6 +927,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     if orig_direction not in ("LONG", "SHORT"):
         return
 
+    # Penentuan Eksekusi Aktual
     if is_logic_inverted and _inverted_forced_side:
         execution_side = _inverted_forced_side
     else:
@@ -908,6 +949,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
+    # 1. Set Leverage
     try:
         _rest_call(f"set_leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
     except Exception as e:
@@ -915,6 +957,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     order_side = "BUY" if execution_side == "LONG" else "SELL"
 
+    # 2. Eksekusi Market Order ke Binance API
     try:
         order_res = _rest_call(
             f"open_order_{sym}",
@@ -984,6 +1027,7 @@ def live_close(sym, reason, price=None):
     q_val = pos["qty"]
     close_side = "SELL" if side == "LONG" else "BUY"
 
+    # 1. Eksekusi Market Close Order ke Binance API
     try:
         close_res = _rest_call(
             f"close_order_{sym}",
@@ -1008,6 +1052,7 @@ def live_close(sym, reason, price=None):
     entry = pos["entry"]
     entry_mode = pos.get("mode", "NORMAL")
 
+    # 2. Synchronize PnL Langsung dari API Trades Binance
     pnl_synced = False
     try:
         time.sleep(0.3)
@@ -1141,7 +1186,7 @@ def monitor_positions():
             continue
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCANNER THREAD & ADAPTIVE FILTERS
+#  SCANNER THREAD & STRICT FILTERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def scan_one(sym):
@@ -1159,8 +1204,14 @@ def scan_one(sym):
 
         if px_candle == 0 or np.isnan(atr_val): return None
 
-        # Filter Longgar & Adaptif
-        if vr_val < MIN_VOLUME_RATIO or adx_val < MIN_ADX_TREND or (atr_val / px_candle) < MIN_ATR_PCT:
+        # ── FILTER 1: Strict Volume & Sideway Guard ─────────────────────────
+        if vr_val < MIN_VOLUME_RATIO:
+            _stats["low_vol_veto"] += 1
+            return None
+        if adx_val < MIN_ADX_TREND:
+            _stats["low_vol_veto"] += 1
+            return None
+        if (atr_val / px_candle) < MIN_ATR_PCT:
             _stats["low_vol_veto"] += 1
             return None
 
@@ -1168,6 +1219,7 @@ def scan_one(sym):
         if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
             return None
 
+        # Penentuan Eksekusi Aktual
         if is_logic_inverted and _inverted_forced_side:
             opposite_needed = "LONG" if _inverted_forced_side == "SHORT" else "SHORT"
             if orig_direction != opposite_needed:
@@ -1176,18 +1228,21 @@ def scan_one(sym):
         else:
             execution_side = orig_direction
 
+        # ── FILTER 2: DIRECTIONAL SAME-SIDE LOSS GUARD ─────────────────────
         if _last_failed_execution_side is not None and execution_side == _last_failed_execution_side:
             required_score = MIN_SCORE + SAME_SIDE_EXTRA_SCORE
+            
             m5_val = last_row.get("m5", 0.0)
-            trend_aligned = (execution_side == "LONG" and m5_val > 0.0005) or (execution_side == "SHORT" and m5_val < -0.0005)
+            trend_aligned = (execution_side == "LONG" and m5_val > 0.001) or (execution_side == "SHORT" and m5_val < -0.001)
 
-            if score < required_score or adx_val < 18.0 or not trend_aligned:
+            if score < required_score or adx_val < 25.0 or not trend_aligned:
                 _stats["same_side_veto"] += 1
                 return None
 
         px_live = price_live(sym)
         if px_live == 0: return None
 
+        # Filter Veto BTC Breaker & Order Book Depth
         btc_vetoed, _ = btc_macro.check_veto(execution_side)
         if btc_vetoed:
             _stats["btc_breaker_veto"] += 1
@@ -1204,8 +1259,8 @@ def scan_one(sym):
             return None
 
         imb = order_book.get_imbalance(sym)
-        if execution_side == "LONG" and imb < -0.45: return None
-        elif execution_side == "SHORT" and imb > 0.45: return None
+        if execution_side == "LONG" and imb < -0.40: return None
+        elif execution_side == "SHORT" and imb > 0.40: return None
 
         risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
 
@@ -1237,7 +1292,7 @@ def print_inline():
     forced_str = f"({_inverted_forced_side})" if _inverted_forced_side else ""
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
     acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
-    print(f"        ┌ [API ENGINE v23.1 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    print(f"        ┌ [API ENGINE v23.0 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
     print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
 
 def print_full():
@@ -1405,11 +1460,13 @@ def handle_depth_multiplex(msg):
 def run_bot():
     acc_type_str = "BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET"
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print(f"║  💎 BOT SCALPING v23.1 — LIVE BINANCE API EXECUTION ENGINE         ║")
+    print(f"║  💎 BOT SCALPING v23.0 — LIVE BINANCE API EXECUTION ENGINE         ║")
     print(f"║  MODE AKUN: {acc_type_str:<51} ║")
     print("║  1. Mode Awal: NORMAL (Arah Bebas Sesuai Sinyal Indikator)         ║")
-    print("║  2. Strict Filter: Volume Ratio >= 0.65 & ADX >= 15 (Anti-Sideway) ║")
-    print("║  3. Inverted Lock Engine Active                                    ║")
+    print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
+    print("║  3. Inverted Lock Engine:                                          ║")
+    print("║     * Loss di NORMAL (LONG)  -> DIPAKSA SHORT SAMPAI LOSS          ║")
+    print("║     * Loss di NORMAL (SHORT) -> DIPAKSA LONG SAMPAI LOSS           ║")
     print(f"║  4. Target Profit Mingguan = ${ORDER_USDT:.2f} (Auto Pause & Reset Senin WITA)║")
     print("║  5. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
@@ -1436,6 +1493,7 @@ def run_bot():
         twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
         time.sleep(0.15)
 
+    # ── STARTUP WARM-UP BUFFER (Fix Cold-Start Delay) ──────────────────────
     print("  ⏳ Memulai Instant Warm-Up: Sinkronisasi data awal WebSocket...")
     for s in syms[:BATCH_SIZE]:
         _bootstrap_klines(s, Client.KLINE_INTERVAL_5MINUTE, 100)
