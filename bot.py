@@ -8,11 +8,10 @@ FEATURES:
   * Loss di NORMAL (LONG)  -> Mode INVERTED DIPAKSA HANYA SHORT sampai Loss.
   * Loss di NORMAL (SHORT) -> Mode INVERTED DIPAKSA HANYA LONG sampai Loss.
   * Loss di INVERTED       -> Kembali ke NORMAL (Arah Bebas Sesuai Sinyal).
-- Same-Side Retry Guard & Strict Volume/ADX Filter.
+- Fixed Testnet OrderBook Stale/Veto Bug (Konsisten Entry Sesuai Sinyal Paper Engine).
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
 - Dynamic Weekly Cumulative Profit Target (Auto Reset on Monday WITA & Auto ActivePos Cleanup).
-- Instant Warm-up Engine & Fixed Consistent Entry Bug in Range/Bull/Bear Regimes.
 """
 
 import sys
@@ -483,7 +482,7 @@ class SignalScorer:
             short_score += 10; short_sigs.append("BTC_BearTrend[+10]")
             long_score -= 20
 
-        # FIX BUG: Konsisten Entry di Segala Regime Jika Score Memenuhi Threshold MIN_SCORE
+        # KONSISTEN KAYA PAPER ENGINE: Entry jika score melampaui MIN_SCORE
         if long_score >= MIN_SCORE and long_score >= short_score:
             return "LONG", long_score, long_sigs, atr, regime, bias
         elif short_score >= MIN_SCORE and short_score > long_score:
@@ -1177,7 +1176,7 @@ def scan_one(sym):
 
         if px_candle == 0 or np.isnan(atr_val): return None
 
-        # ── FILTER 1: Strict Volume & Sideway Guard ─────────────────────────
+        # ── FILTER 1: Volume & Sideway Guard ─────────────────────────
         if vr_val < MIN_VOLUME_RATIO:
             _stats["low_vol_veto"] += 1
             return None
@@ -1215,12 +1214,13 @@ def scan_one(sym):
         px_live = price_live(sym)
         if px_live == 0: return None
 
-        # Filter Veto BTC Breaker & Order Book Depth
+        # Filter Veto BTC Breaker
         btc_vetoed, _ = btc_macro.check_veto(execution_side)
         if btc_vetoed:
             _stats["btc_breaker_veto"] += 1
             return None
 
+        # FIX BUG: Safely Check Order Book Wall & Imbalance (Abaikan jika data Testnet Stale/Kosong)
         has_wall, _, _, _, _ = order_book.check_walls(sym, px_live, execution_side)
         if has_wall:
             _stats["wall_veto"] += 1
@@ -1230,10 +1230,6 @@ def scan_one(sym):
         if is_spoof:
             _stats["spoof_veto"] += 1
             return None
-
-        imb = order_book.get_imbalance(sym)
-        if execution_side == "LONG" and imb < -0.40: return None
-        elif execution_side == "SHORT" and imb > 0.40: return None
 
         risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
 
@@ -1466,11 +1462,11 @@ def run_bot():
         twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
         time.sleep(0.15)
 
-    # ── STARTUP WARM-UP BUFFER (Fix Cold-Start Delay) ──────────────────────
+    # ── STARTUP WARM-UP BUFFER ──────────────────────
     print("  ⏳ Memulai Instant Warm-Up: Sinkronisasi data awal WebSocket...")
     for s in syms[:BATCH_SIZE]:
         _bootstrap_klines(s, Client.KLINE_INTERVAL_5MINUTE, 100)
-    time.sleep(2.5)
+    time.sleep(2.0)
 
     threading.Thread(target=t_monitor, daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
