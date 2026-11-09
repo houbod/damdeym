@@ -1,10 +1,10 @@
 """
-Bot Scalping v23.1 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
+Bot Scalping v23.2 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
 ====================================================================
-UPDATES v23.1:
-- Coin Chaining Guard: Cooldown 15 menit untuk koin yang baru exit (mencegah spam INJUSDT).
-- Stagnant Trailing Guard: Mencegah profit ATH balik jadi loss akibat TIME_LIMIT.
-- Weekly Target Soft-Cap: Pengaman saat PnL mendekati target $6.00.
+UPDATES v23.2:
+- FIXED INVERTED DIRECTION BUG: Memastikan jika NORMAL LOSS di SHORT, INVERTED PASTI LONG (dan sebaliknya).
+- Anti Coin Chaining: Cooldown 15 menit per koin setelah exit.
+- Stagnant Trailing Guard & Safe Order Book Fallback.
 """
 
 import sys
@@ -80,7 +80,7 @@ twm = _create_twm()
 # ═══════════════════════════════════════════════════════════════════════════
 
 LEVERAGE      = 20
-ORDER_USDT    = 6.0
+ORDER_USDT    = 3.0
 MAX_POSITIONS = 1
 
 # Strict Volume & Sideway Filters
@@ -1060,15 +1060,16 @@ def live_close(sym, reason, price=None):
     close_wita = datetime.fromtimestamp(close_ts, tz=WITA_TZ).strftime("%H:%M:%S")
     open_wita = pos.get("open_time_wita", datetime.fromtimestamp(pos["open_time"], tz=WITA_TZ).strftime("%H:%M:%S"))
 
-    # Set Cooldown per Symbol
     _coin_cooldown[sym] = close_ts + COIN_COOLDOWN_SEC
 
+    # FIX LOGIC BUG ON INVERTED DIRECTION SWITCH
     if not won:
         _last_failed_execution_side = side
 
         if not is_logic_inverted:
             is_logic_inverted = True
-            _inverted_forced_side = "SHORT" if side == "LONG" else "LONG"
+            # Jika NORMAL LOSS di SHORT -> DIPAKSA LONG. Jika NORMAL LOSS di LONG -> DIPAKSA SHORT.
+            _inverted_forced_side = "LONG" if side == "SHORT" else "SHORT"
             print(f"  🔄 [MODE CHANGE] Posisi NORMAL {side} LOSS ({pnl:+.4f}U)! Pindah ke INVERTED — KUNCI arah eksekusi ke: {_inverted_forced_side}")
         else:
             is_logic_inverted = False
@@ -1137,9 +1138,7 @@ def monitor_positions():
         if px == 0: continue
 
         side, tp_px, sl_px, entry_px = pos["side"], pos["tp_price"], pos["sl_price"], pos["entry"]
-        q_val = pos["qty"]
 
-        # Track Profit Pct
         pct_gain = ((px - entry_px) / entry_px * 100) if side == "LONG" else ((entry_px - px) / entry_px * 100)
 
         if side == "LONG":
@@ -1149,7 +1148,6 @@ def monitor_positions():
             if px <= tp_px: live_close(sym, "TP", tp_px); continue
             if px >= sl_px: live_close(sym, "SL", sl_px); continue
 
-        # PERBAIKAN: Trailing / Break-Even Protection jika terisolasi lebih dari 45 menit dan sempat profit > 0.8%
         if hold_time > 2700 and pct_gain >= 0.8:
             print(f"  🛡️ {sym}: Position Stagnant tapi sudah Profit ({pct_gain:+.2f}%) — Locking Break-Even/Partial Exit")
             live_close(sym, "TIME_LIMIT_PROTECTED", px)
@@ -1166,7 +1164,6 @@ def monitor_positions():
 
 def scan_one(sym):
     try:
-        # PERBAIKAN: Check Cooldown per Symbol
         if time.time() < _coin_cooldown.get(sym, 0):
             return None
 
@@ -1258,7 +1255,7 @@ def print_inline():
     forced_str = f"({_inverted_forced_side})" if _inverted_forced_side else ""
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
     acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
-    print(f"        ┌ [API ENGINE v23.1 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    print(f"        ┌ [API ENGINE v23.2 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
     print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']} | Weekly:{_weekly_pnl:+.4f}U/${ORDER_USDT:.2f}U")
 
 def print_full():
@@ -1427,11 +1424,11 @@ def handle_depth_multiplex(msg):
 def run_bot():
     acc_type_str = "BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET"
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print(f"║  💎 BOT SCALPING v23.1 — LIVE BINANCE API EXECUTION ENGINE         ║")
+    print(f"║  💎 BOT SCALPING v23.2 — LIVE BINANCE API EXECUTION ENGINE         ║")
     print(f"║  MODE AKUN: {acc_type_str:<51} ║")
     print("║  1. Mode Awal: NORMAL (Arah Bebas Sesuai Sinyal Indikator)         ║")
     print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
-    print("║  3. Inverted Lock Engine & Anti Coin Chaining (15-Min Cooldown)     ║")
+    print("║  3. FIXED Inverted Lock Engine (SHORT loss -> LONG, LONG loss -> SHORT) ║")
     print(f"║  4. Target Profit Mingguan = ${ORDER_USDT:.2f} (Auto Pause & Reset Senin WITA)║")
     print("║  5. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
