@@ -5,6 +5,14 @@ UPDATES v23.2:
 - FIXED INVERTED DIRECTION BUG: Memastikan jika NORMAL LOSS di SHORT, INVERTED PASTI LONG (dan sebaliknya).
 - Anti Coin Chaining: Cooldown 15 menit per koin setelah exit.
 - Stagnant Trailing Guard & Safe Order Book Fallback.
+
+PERBAIKAN TAMBAHAN (hotfix):
+- FIX RACE CONDITION: slot posisi sekarang TETAP TERISI selama proses close berlangsung,
+  dan baru dilepas SETELAH mode NORMAL/INVERTED di-flip + cooldown koin terpasang.
+  (Sebelumnya scanner bisa entry di tengah proses close dengan mode lama -> LONG setelah LONG loss.)
+- FIX LABEL MODE: entry_mode & execution_side ditentukan bersamaan di awal live_open.
+- FIX DEADLOCK INVERTED: di mode INVERTED arah eksekusi sudah dikunci, jadi bot TIDAK lagi
+  mewajibkan sinyal analisa berlawanan (yang bentrok dengan penalti BTC trend dan membuat bot tidak pernah entry).
 """
 
 import sys
@@ -894,10 +902,14 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     if orig_direction not in ("LONG", "SHORT"):
         return
 
+    # FIX: execution_side & entry_mode ditentukan BERSAMAAN dari state mode yang sama (snapshot),
+    # supaya label mode selalu konsisten dengan arah yang benar-benar dieksekusi.
     if is_logic_inverted and _inverted_forced_side:
         execution_side = _inverted_forced_side
+        entry_mode = "INVERTED"
     else:
         execution_side = orig_direction
+        entry_mode = "INVERTED" if is_logic_inverted else "NORMAL"
 
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
@@ -942,7 +954,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
     open_ts = time.time()
-    entry_mode = "INVERTED" if is_logic_inverted else "NORMAL"
     acc_label = "TESTNET DEMO" if USE_DEMO_ACCOUNT else "REAL MAINNET"
 
     pos = {
@@ -981,11 +992,14 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 def live_close(sym, reason, price=None):
     global is_logic_inverted, _last_failed_execution_side, _inverted_forced_side, _weekly_pnl
 
+    # FIX RACE CONDITION: posisi TIDAK di-pop di awal. Slot tetap terisi (len(live_positions) tetap penuh)
+    # selama proses close, sehingga scanner tidak bisa entry dengan mode lama.
+    # Posisi baru dihapus SETELAH mode di-flip & cooldown koin terpasang (lihat bawah).
     with _lock:
-        pos = live_positions.pop(sym, None)
-
-    if pos is None or pos.get("_r"):
-        return
+        pos = live_positions.get(sym)
+        if pos is None or pos.get("_r") or pos.get("_closing"):
+            return
+        pos["_closing"] = True
 
     side = pos["side"]
     q_val = pos["qty"]
@@ -1006,7 +1020,7 @@ def live_close(sym, reason, price=None):
             price = avg_close_price
     except Exception as e:
         print(f"  ❌ [API CLOSE ERROR] Gagal Tutup Posisi {side} pada {sym}: {e}")
-        with _lock: live_positions[sym] = pos
+        pos["_closing"] = False   # posisi masih ada di live_positions, monitor boleh coba lagi
         return
 
     if price is None or price <= 0:
@@ -1081,6 +1095,11 @@ def live_close(sym, reason, price=None):
         forced_str = f" (Locked:{_inverted_forced_side})" if _inverted_forced_side else ""
         print(f"  ✅ [LOGIC STABLE] Posisi {side} PROFIT ({pnl:+.4f}U)! Mode Tetap: {current_mode}{forced_str}")
 
+    # FIX RACE CONDITION: baru sekarang slot dilepas — mode sudah ter-flip & cooldown koin sudah terpasang,
+    # jadi entry berikutnya pasti memakai mode/arah yang benar.
+    with _lock:
+        live_positions.pop(sym, None)
+
     print(
         f"  {e_icon} [API EXIT CLOSED] {sym} {side} CLOSE [{entry_mode}] — {reason} | "
         f"{entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U | Out:{close_wita} WITA"
@@ -1131,7 +1150,7 @@ def live_close(sym, reason, price=None):
 def monitor_positions():
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
-        if pos is None or pos.get("_r"): continue
+        if pos is None or pos.get("_r") or pos.get("_closing"): continue
 
         hold_time = time.time() - pos["open_time"]
         px = price_live(sym)
@@ -1189,10 +1208,10 @@ def scan_one(sym):
         if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
             return None
 
+        # FIX DEADLOCK INVERTED: saat INVERTED arah eksekusi sudah dikunci (_inverted_forced_side),
+        # jadi sinyal analisa apa pun (LONG/SHORT) yang lolos filter & skor boleh dipakai.
+        # Sebelumnya wajib sinyal berlawanan, yang bentrok dengan penalti BTC trend (-20) sehingga bot tidak pernah entry.
         if is_logic_inverted and _inverted_forced_side:
-            opposite_needed = "LONG" if _inverted_forced_side == "SHORT" else "SHORT"
-            if orig_direction != opposite_needed:
-                return None
             execution_side = _inverted_forced_side
         else:
             execution_side = orig_direction
